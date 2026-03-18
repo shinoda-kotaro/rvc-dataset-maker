@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -362,6 +363,9 @@ def build_dataset(
     progress: ProgressFn | None = None,
     require_gpu: bool = True,
 ) -> Path:
+    def elapsed_sec(started_at: float) -> str:
+        return f"{time.perf_counter() - started_at:.2f}s"
+
     def log(message: str) -> None:
         if progress is not None:
             progress(message)
@@ -388,16 +392,22 @@ def build_dataset(
         demucs_dir.mkdir(parents=True, exist_ok=True)
 
         log("[1/6] YouTube から音声を取得中...")
+        t1 = time.perf_counter()
         downloaded_path, title = download_audio(url, download_dir)
         dataset_name = slugify(title)
+        log(f"[1/6] 完了 ({elapsed_sec(t1)})")
 
         clean_wav = work_dir / "clean.wav"
 
         log("[2/6] WAV に変換中...")
+        t2 = time.perf_counter()
         convert_to_clean_wav(downloaded_path, clean_wav)
+        log(f"[2/6] 完了 ({elapsed_sec(t2)})")
 
         log("[3/6] Demucs で BGM 除去中...")
+        t3 = time.perf_counter()
         vocals_wav = run_demucs(clean_wav, demucs_dir, device="cuda" if require_gpu else "cpu")
+        log(f"[3/6] 完了 ({elapsed_sec(t3)})")
 
         dataset_dir = output_root / dataset_name
         raw_dir = dataset_dir / "raw"
@@ -408,7 +418,9 @@ def build_dataset(
         rejected_dir.mkdir(parents=True, exist_ok=True)
 
         log("[4/6] slicer2 で分割 + ゴミ除去中...")
+        t4 = time.perf_counter()
         metas = extract_segments_with_slicer2(vocals_wav, raw_dir, rejected_dir)
+        log(f"[4/6] 完了 ({elapsed_sec(t4)})")
 
         if not metas:
             raise RuntimeError(
@@ -417,6 +429,7 @@ def build_dataset(
             )
 
         log("[5/6] metadata / README を出力中...")
+        t5 = time.perf_counter()
         meta_path = dataset_dir / "metadata.json"
         with meta_path.open("w", encoding="utf-8") as f:
             json.dump(
@@ -458,10 +471,13 @@ def build_dataset(
 
         readme_path = dataset_dir / "README.txt"
         readme_path.write_text(make_readme(dataset_name, url, metas), encoding="utf-8")
+        log(f"[5/6] 完了 ({elapsed_sec(t5)})")
 
         log("[6/6] ZIP 作成中...")
+        t6 = time.perf_counter()
         zip_path = dataset_dir / f"{dataset_name}.zip"
         zip_raw_directory(raw_dir, zip_path)
+        log(f"[6/6] 完了 ({elapsed_sec(t6)})")
 
         log(f"完了: {zip_path}")
         return zip_path
