@@ -1,0 +1,17 @@
+[project]
+name = "rvc-dataset-maker"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "demucs>=4.0.1",
+    "gradio>=5.22.0",
+    "librosa>=0.11.0",
+    "numpy>=2.2.6",
+    "soundfile>=0.13.1",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "torchcodec>=0.10.0",
+    "yt-dlp>=2026.3.17",
+]
