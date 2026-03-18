@@ -7,6 +7,7 @@ Colab の GPU 実行を前提にしています。
 
 - YouTube から音声をダウンロード（`yt-dlp`）
 - `ffmpeg` でモノラル 40kHz WAV に前処理
+- 長尺動画向けに先にチャンク分割（デフォルト: 600秒）
 - `demucs` でボーカル抽出（BGM 除去）
 - `slicer2` で無音ベース分割
 - クリップ品質フィルタ（長さ、RMS、ZCR など）
@@ -73,6 +74,12 @@ GPU 必須（デフォルト）:
 uv run python main.py "https://www.youtube.com/watch?v=XXXXXXXXXXX" --output "/content/output"
 ```
 
+チャンク秒数を変更する場合（例: 8分=480秒）:
+
+```bash
+uv run python main.py "https://www.youtube.com/watch?v=XXXXXXXXXXX" --output "/content/output" --chunk-sec 480
+```
+
 CPU 実行を許可する場合（デバッグ用）:
 
 ```bash
@@ -92,6 +99,8 @@ UI で以下を入力して実行:
 
 実行中は `進捗ログ` に `[1/6] ... [6/6]` の進行状況が表示されます。完了後に `生成ZIPのパス` が表示されます。
 
+`[4/6]` では `[chunk i/N]` の単位で進捗と処理時間を表示します。
+
 ## 出力構成
 
 実行後、`<output>/<dataset_name>/` が作成されます。
@@ -102,8 +111,24 @@ UI で以下を入力して実行:
 - `README.txt`: データセット概要
 - `<dataset_name>.zip`: `raw` ディレクトリを zip 化したファイル
 
+## OOM診断
+
+Demucs 失敗時は以下をログに出します。
+
+- `returncode`
+- `stderr` が空かどうか
+- `nvidia-smi` のスナップショット
+- `OOMの可能性: 高 / 中 / 低`
+
+判定の目安:
+
+- `高`: `CUDA out of memory`、`out of memory`、`killed`、`returncode=-9/137`
+- `中`: `stderr` が空のまま異常終了
+- `低`: 上記に該当しない
+
 ## 補足
 
 - 本アプリは単体動画（`noplaylist=True`）を対象にしています。
 - デフォルトは GPU 必須です。GPU が見えない場合はエラーで停止します。
+- 2〜3時間級の長尺を想定し、全編一括ではなくチャンクごとに Demucs + 分割処理を行います。
 - 出力データの利用時は、元コンテンツの利用規約・著作権に注意してください。

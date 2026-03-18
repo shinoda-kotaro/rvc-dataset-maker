@@ -24,6 +24,7 @@ from slicer2 import Slicer
 
 
 TARGET_SR = 40000
+CHUNK_DURATION_SEC = 600
 
 # slicer2 settings
 SLICER_THRESHOLD_DB = -40
@@ -66,6 +67,21 @@ class SegmentMeta:
     clipping_ratio: float
 
 
+class CommandExecutionError(RuntimeError):
+    def __init__(self, cmd: List[str], returncode: int, stdout: str, stderr: str):
+        self.cmd = cmd
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        super().__init__(
+            "コマンド実行に失敗しました。\n"
+            f"returncode: {returncode}\n"
+            f"cmd: {' '.join(cmd)}\n\n"
+            f"stdout:\n{stdout}\n\n"
+            f"stderr:\n{stderr}"
+        )
+
+
 def slugify(text: str, max_len: int = 80) -> str:
     text = re.sub(r'[\\/:*?"<>|]+', "_", text)
     text = re.sub(r"\s+", "_", text).strip("_")
@@ -84,7 +100,7 @@ def ensure_cuda_available() -> None:
         )
 
 
-def run_cmd(cmd: List[str], cwd: Path | None = None) -> None:
+def run_cmd(cmd: List[str], cwd: Path | None = None) -> tuple[str, str]:
     proc = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -97,12 +113,9 @@ def run_cmd(cmd: List[str], cwd: Path | None = None) -> None:
     stderr = proc.stderr.decode("utf-8", errors="replace")
 
     if proc.returncode != 0:
-        raise RuntimeError(
-            "コマンド実行に失敗しました。\n"
-            f"cmd: {' '.join(cmd)}\n\n"
-            f"stdout:\n{stdout}\n\n"
-            f"stderr:\n{stderr}"
-        )
+        raise CommandExecutionError(cmd=cmd, returncode=proc.returncode, stdout=stdout, stderr=stderr)
+
+    return stdout, stderr
 
 
 def dbfs_rms(y: np.ndarray) -> float:
@@ -169,6 +182,68 @@ def convert_to_clean_wav(src_path: Path, dst_path: Path) -> None:
         str(dst_path),
     ]
     run_cmd(cmd)
+
+
+def split_wav_into_chunks(src_wav: Path, chunks_dir: Path, chunk_sec: int = CHUNK_DURATION_SEC) -> List[Path]:
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    chunk_pattern = chunks_dir / "chunk_%05d.wav"
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src_wav),
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_sec),
+        "-c",
+        "copy",
+        str(chunk_pattern),
+    ]
+    run_cmd(cmd)
+
+    chunks = sorted(chunks_dir.glob("chunk_*.wav"))
+    if not chunks:
+        raise RuntimeError("音声チャンクを生成できませんでした。")
+    return chunks
+
+
+def get_nvidia_smi_snapshot() -> str:
+    if shutil.which("nvidia-smi") is None:
+        return "nvidia-smi が見つかりません。"
+
+    query_cmd = [
+        "nvidia-smi",
+        "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ]
+
+    proc = subprocess.run(query_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip()
+
+    proc2 = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc2.returncode == 0:
+        return proc2.stdout.strip()
+
+    return f"nvidia-smi 取得失敗: {proc2.stderr.strip() or proc.stderr.strip() or 'unknown'}"
+
+
+def classify_oom_likelihood(error: CommandExecutionError) -> tuple[str, str]:
+    stderr_lower = error.stderr.lower()
+
+    if "cuda out of memory" in stderr_lower:
+        return "高", "stderr に 'CUDA out of memory' が含まれています。"
+    if "out of memory" in stderr_lower:
+        return "高", "stderr に 'out of memory' が含まれています。"
+    if "killed" in stderr_lower:
+        return "高", "stderr に 'killed' が含まれています。"
+    if error.returncode in (-9, 137):
+        return "高", f"returncode={error.returncode} (SIGKILL 相当) のため強制終了の可能性があります。"
+    if not error.stderr.strip() and error.returncode != 0:
+        return "中", "stderr が空で異常終了しており、OOM またはランタイム制限による強制終了の可能性があります。"
+    return "低", "OOM を示す典型パターンは検出されませんでした。"
 
 
 def run_demucs(input_wav: Path, demucs_out_dir: Path, device: str = "cuda") -> Path:
@@ -262,7 +337,13 @@ def is_garbage_clip(y: np.ndarray, sr: int) -> tuple[bool, dict]:
     return False, reasons
 
 
-def extract_segments_with_slicer2(wav_path: Path, raw_dir: Path, rejected_dir: Path) -> List[SegmentMeta]:
+def extract_segments_with_slicer2(
+    wav_path: Path,
+    raw_dir: Path,
+    rejected_dir: Path,
+    seg_idx_start: int,
+    rej_idx_start: int,
+) -> tuple[List[SegmentMeta], int, int]:
     audio, sr = librosa.load(wav_path, sr=None, mono=False)
 
     slicer = Slicer(
@@ -276,8 +357,8 @@ def extract_segments_with_slicer2(wav_path: Path, raw_dir: Path, rejected_dir: P
 
     raw_chunks = slicer.slice(audio)
     metas: List[SegmentMeta] = []
-    seg_idx = 1
-    rej_idx = 1
+    seg_idx = seg_idx_start
+    rej_idx = rej_idx_start
 
     for chunk in raw_chunks:
         if len(chunk.shape) > 1:
@@ -315,10 +396,10 @@ def extract_segments_with_slicer2(wav_path: Path, raw_dir: Path, rejected_dir: P
             )
             seg_idx += 1
 
-    return metas
+    return metas, seg_idx, rej_idx
 
 
-def make_readme(dataset_name: str, source_url: str, metas: List[SegmentMeta]) -> str:
+def make_readme(dataset_name: str, source_url: str, metas: List[SegmentMeta], chunk_sec: int) -> str:
     total_sec = sum(m.duration_sec for m in metas)
     return (
         f"# {dataset_name}\n\n"
@@ -329,7 +410,8 @@ def make_readme(dataset_name: str, source_url: str, metas: List[SegmentMeta]) ->
         "Pipeline:\n"
         "- yt-dlp download\n"
         "- ffmpeg preprocess\n"
-        "- Demucs vocals separation\n"
+        f"- ffmpeg chunk split ({chunk_sec}s per chunk)\n"
+        "- Demucs vocals separation (per chunk)\n"
         "- slicer2 silence slicing\n"
         "- garbage clip filtering\n"
         "- zip packaging\n\n"
@@ -362,6 +444,7 @@ def build_dataset(
     output_root: Path,
     progress: ProgressFn | None = None,
     require_gpu: bool = True,
+    chunk_sec: int = CHUNK_DURATION_SEC,
 ) -> Path:
     def elapsed_sec(started_at: float) -> str:
         return f"{time.perf_counter() - started_at:.2f}s"
@@ -385,10 +468,12 @@ def build_dataset(
         tmp_dir = Path(tmp)
         download_dir = tmp_dir / "download"
         work_dir = tmp_dir / "work"
+        chunks_dir = tmp_dir / "chunks"
         demucs_dir = tmp_dir / "demucs"
 
         download_dir.mkdir(parents=True, exist_ok=True)
         work_dir.mkdir(parents=True, exist_ok=True)
+        chunks_dir.mkdir(parents=True, exist_ok=True)
         demucs_dir.mkdir(parents=True, exist_ok=True)
 
         log("[1/6] YouTube から音声を取得中...")
@@ -404,10 +489,10 @@ def build_dataset(
         convert_to_clean_wav(downloaded_path, clean_wav)
         log(f"[2/6] 完了 ({elapsed_sec(t2)})")
 
-        log("[3/6] Demucs で BGM 除去中...")
+        log(f"[3/6] 長尺チャンク分割中... (chunk={chunk_sec}s)")
         t3 = time.perf_counter()
-        vocals_wav = run_demucs(clean_wav, demucs_dir, device="cuda" if require_gpu else "cpu")
-        log(f"[3/6] 完了 ({elapsed_sec(t3)})")
+        chunk_paths = split_wav_into_chunks(clean_wav, chunks_dir, chunk_sec=chunk_sec)
+        log(f"[3/6] 完了 ({elapsed_sec(t3)}) chunks={len(chunk_paths)}")
 
         dataset_dir = output_root / dataset_name
         raw_dir = dataset_dir / "raw"
@@ -417,9 +502,52 @@ def build_dataset(
         raw_dir.mkdir(parents=True, exist_ok=True)
         rejected_dir.mkdir(parents=True, exist_ok=True)
 
-        log("[4/6] slicer2 で分割 + ゴミ除去中...")
+        log("[4/6] チャンク処理中 (Demucs + slicer2)...")
         t4 = time.perf_counter()
-        metas = extract_segments_with_slicer2(vocals_wav, raw_dir, rejected_dir)
+
+        metas: List[SegmentMeta] = []
+        next_seg_idx = 1
+        next_rej_idx = 1
+        total_chunks = len(chunk_paths)
+
+        for idx, chunk_path in enumerate(chunk_paths, start=1):
+            chunk_start = time.perf_counter()
+            log(f"[4/6] [chunk {idx}/{total_chunks}] Demucs 実行中...")
+
+            try:
+                vocals_wav = run_demucs(chunk_path, demucs_dir, device="cuda" if require_gpu else "cpu")
+            except CommandExecutionError as e:
+                likelihood, reason = classify_oom_likelihood(e)
+                nvidia_smi = get_nvidia_smi_snapshot()
+                raise RuntimeError(
+                    "Demucs 実行に失敗しました。\n"
+                    f"OOMの可能性: {likelihood}\n"
+                    f"判定理由: {reason}\n"
+                    f"returncode: {e.returncode}\n"
+                    f"cmd: {' '.join(e.cmd)}\n"
+                    f"stderr(empty?): {not bool(e.stderr.strip())}\n"
+                    "--- nvidia-smi ---\n"
+                    f"{nvidia_smi}\n"
+                    "--- stdout ---\n"
+                    f"{e.stdout}\n"
+                    "--- stderr ---\n"
+                    f"{e.stderr}"
+                )
+
+            chunk_metas, next_seg_idx, next_rej_idx = extract_segments_with_slicer2(
+                vocals_wav,
+                raw_dir,
+                rejected_dir,
+                seg_idx_start=next_seg_idx,
+                rej_idx_start=next_rej_idx,
+            )
+            metas.extend(chunk_metas)
+
+            log(
+                f"[4/6] [chunk {idx}/{total_chunks}] 完了 ({elapsed_sec(chunk_start)}) "
+                f"accepted={len(chunk_metas)} cumulative={len(metas)}"
+            )
+
         log(f"[4/6] 完了 ({elapsed_sec(t4)})")
 
         if not metas:
@@ -439,6 +567,11 @@ def build_dataset(
                     "sample_rate": TARGET_SR,
                     "segment_count": len(metas),
                     "segments": [asdict(m) for m in metas],
+                    "chunking": {
+                        "enabled": True,
+                        "chunk_sec": chunk_sec,
+                        "chunk_count": len(chunk_paths),
+                    },
                     "slicer": {
                         "type": "slicer2",
                         "threshold": SLICER_THRESHOLD_DB,
@@ -470,7 +603,7 @@ def build_dataset(
             )
 
         readme_path = dataset_dir / "README.txt"
-        readme_path.write_text(make_readme(dataset_name, url, metas), encoding="utf-8")
+        readme_path.write_text(make_readme(dataset_name, url, metas, chunk_sec=chunk_sec), encoding="utf-8")
         log(f"[5/6] 完了 ({elapsed_sec(t5)})")
 
         log("[6/6] ZIP 作成中...")
@@ -496,13 +629,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="GPU がない環境でも CPU で実行する (Colab では通常不要)",
     )
+    parser.add_argument(
+        "--chunk-sec",
+        type=int,
+        default=CHUNK_DURATION_SEC,
+        help=f"Demucs 前に分割するチャンク秒数 (default: {CHUNK_DURATION_SEC})",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
-        zip_path = build_dataset(args.url, Path(args.output), require_gpu=not args.allow_cpu)
+        zip_path = build_dataset(
+            args.url,
+            Path(args.output),
+            require_gpu=not args.allow_cpu,
+            chunk_sec=args.chunk_sec,
+        )
         print(f"\n完了: {zip_path}")
         return 0
     except Exception as e:
